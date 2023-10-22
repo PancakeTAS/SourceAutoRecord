@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <d3d9.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -35,6 +36,12 @@ static int *g_snd_linear_count;
 static int **g_snd_p;
 static int *g_snd_vol;
 static MovieInfo_t *g_movieInfo;
+
+// DirectX variables
+static IDirect3DDevice9 *device;
+static IDirect3DSurface9 *backBuffer;
+static D3DSURFACE_DESC desc;
+static IDirect3DSurface9* surface;
 
 // The demoplayer tick this segment ends on (we'll stop recording at
 // this tick if sar_render_autostop is set)
@@ -71,16 +78,8 @@ static Variable sar_render_skip_coop_videos("sar_render_skip_coop_videos", "1", 
 
 // g_videomode VMT wrappers {{{
 
-static inline int GetScreenWidth() {
-	return Memory::VMT<int(__rescall *)(void *)>(*g_videomode, Offsets::GetModeWidth)(*g_videomode);
-}
-
-static inline int GetScreenHeight() {
-	return Memory::VMT<int(__rescall *)(void *)>(*g_videomode, Offsets::GetModeHeight)(*g_videomode);
-}
-
 static inline void ReadScreenPixels(int x, int y, int w, int h, void *buf, ImageFormat fmt) {
-	return Memory::VMT<void(__rescall *)(void *, int, int, int, int, void *, ImageFormat)>(*g_videomode, Offsets::ReadScreenPixels)(*g_videomode, x, y, w, h, buf, fmt);
+    return Memory::VMT<void(__rescall *)(void *, int, int, int, int, void *, ImageFormat)>(*g_videomode, Offsets::ReadScreenPixels)(*g_videomode, x, y, w, h, buf, fmt);
 }
 
 // }}}
@@ -491,7 +490,7 @@ static bool openVideo(AVFormatContext *outputCtx, Stream *s, AVDictionary **opti
 		return false;
 	}
 
-	s->tmpFrame = allocPicture(AV_PIX_FMT_BGR24, s->enc->width, s->enc->height);
+	s->tmpFrame = allocPicture(AV_PIX_FMT_BGRA, s->enc->width, s->enc->height);
 	if (!s->tmpFrame) {
 		console->Print("Failed to allocate intermediate video frame\n");
 		return false;
@@ -502,7 +501,7 @@ static bool openVideo(AVFormatContext *outputCtx, Stream *s, AVDictionary **opti
 		return false;
 	}
 
-	s->swsCtx = sws_getContext(s->enc->width, s->enc->height, AV_PIX_FMT_BGR24, s->enc->width, s->enc->height, s->enc->pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
+	s->swsCtx = sws_getContext(s->enc->width, s->enc->height, AV_PIX_FMT_BGRA, s->enc->width, s->enc->height, s->enc->pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
 	if (!s->swsCtx) {
 		console->Print("Failed to initialize conversion context\n");
 		return false;
@@ -614,7 +613,7 @@ static void workerStartRender(AVCodecID videoCodec, AVCodecID audioCodec, int64_
 
 	g_render.channels = g_render.audioStream.enc->channels;
 
-	g_render.imageBuf = (uint8_t *)malloc(3 * g_render.width * g_render.height);
+	g_render.imageBuf = (uint8_t *)malloc(4 * g_render.width * g_render.height);
 	for (int i = 0; i < g_render.channels; ++i) {
 		g_render.audioBuf[i] = (int16_t *)malloc(g_render.audioBufSz * sizeof g_render.audioBuf[i][0]);
 	}
@@ -622,7 +621,7 @@ static void workerStartRender(AVCodecID videoCodec, AVCodecID audioCodec, int64_
 	g_render.nextBlendIdx = 0;
 	g_render.totalBlendWeight = 0;
 	if (g_render.toBlend > 1) {
-		g_render.blendSumBuf = (uint32_t *)calloc(3 * g_render.width * g_render.height, sizeof g_render.blendSumBuf[0]);
+		g_render.blendSumBuf = (uint32_t *)calloc(4 * g_render.width * g_render.height, sizeof g_render.blendSumBuf[0]);
 	}
 
 	g_movieInfo->moviename[0] = 'a';  // Just something nonzero to make the game think there's a movie in progress
@@ -678,7 +677,6 @@ static void workerFinishRender(bool error) {
 	closeStream(&g_render.audioStream);
 	avio_closep(&g_render.outCtx->pb);
 	avformat_free_context(g_render.outCtx);
-	free(g_render.imageBuf);
 	for (int i = 0; i < g_render.channels; ++i) {
 		free(g_render.audioBuf[i]);
 	}
@@ -703,7 +701,7 @@ static void workerFinishRender(bool error) {
 static bool workerHandleVideoFrame() {
 	g_render.imageBufLock.lock();
 	g_render.workerMsg.store(WorkerMsg::NONE);  // It's important that we do this *after* locking the image buffer
-	size_t size = g_render.width * g_render.height * 3;
+	size_t size = g_render.width * g_render.height * 4;
 	if (g_render.toBlend == 1) {
 		// We can just copy the data directly
 		memcpy(g_render.videoStream.tmpFrame->data[0], g_render.imageBuf, size);
@@ -935,8 +933,8 @@ static void startRender() {
 		}
 	}
 
-	g_render.width = GetScreenWidth();
-	g_render.height = GetScreenHeight();
+	g_render.width = desc.Width;
+	g_render.height = desc.Height;
 
 	g_render.workerFailedToStart.store(false);
 
@@ -1081,18 +1079,6 @@ void Renderer::Frame() {
 	while (g_render.isRendering.load() && g_render.workerMsg.load() != WorkerMsg::NONE)
 		;
 
-	if (GetScreenWidth() != g_render.width) {
-		console->Print("Screen resolution has changed!\n");
-		msgStopRender(true);
-		return;
-	}
-
-	if (GetScreenHeight() != g_render.height) {
-		console->Print("Screen resolution has changed!\n");
-		msgStopRender(true);
-		return;
-	}
-
 	if (av_frame_make_writable(g_render.videoStream.frame) < 0) {
 		console->Print("Failed to make video frame writable!\n");
 		msgStopRender(true);
@@ -1108,7 +1094,27 @@ void Renderer::Frame() {
 		return;
 	}
 
-	ReadScreenPixels(0, 0, g_render.width, g_render.height, g_render.imageBuf, IMAGE_FORMAT_BGR888);
+    ReadScreenPixels(0, 0, 1, 1, g_render.imageBuf, IMAGE_FORMAT_BGR888);
+	HRESULT hr;
+
+	hr = device->GetRenderTargetData(backBuffer, surface);
+	if (hr != D3D_OK) {
+		console->Print("Unable to copy back buffer to surface: %x\n", hr);
+        msgStopRender(true);
+		return;
+	}
+
+	D3DLOCKED_RECT lr = {};
+	hr = surface->LockRect(&lr, 0, D3DLOCK_READONLY);
+	if (hr != D3D_OK) {
+		console->Print("Unable to lock surface to rect: %x\n", hr);
+        msgStopRender(true);
+		return;
+	}
+
+    g_render.imageBuf = (uint8_t*) lr.pBits;
+
+	surface->UnlockRect();
 
 	g_render.imageBufLock.unlock();
 
@@ -1133,6 +1139,27 @@ ON_EVENT(DEMO_STOP) {
 
 void Renderer::Init(void **videomode) {
 	g_videomode = videomode;
+
+	HRESULT hr;
+
+	device = **reinterpret_cast<IDirect3DDevice9***>(Memory::Scan("shaderapidx9.dll", "A1 ? ? ? ? 8B 08 6A 00 57") + 1);
+	hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer);
+	if (hr != D3D_OK) {
+		console->Print("Couldn't get back buffer: %x\n", hr);
+		return;
+	}
+
+	hr = backBuffer->GetDesc(&desc);
+	if (hr != D3D_OK) {
+		console->Print("Couldn't get back buffer surface description: %x\n", hr);
+		return;
+	}
+
+	hr = device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &surface, nullptr);
+	if (hr != D3D_OK) {
+		console->Print("Couldn't create offscreen plain surface: %x\n", hr);
+		return;
+	}
 
 	snd_surround_speakers = Variable("snd_surround_speakers");
 
@@ -1182,6 +1209,10 @@ void Renderer::Init(void **videomode) {
 
 void Renderer::Cleanup() {
 	g_RecordBufferHook.Disable();
+
+	surface->Release();
+	backBuffer->Release();
+
 	Command::Unhook("startmovie", startmovie_origCbk);
 	Command::Unhook("endmovie", endmovie_origCbk);
 }
